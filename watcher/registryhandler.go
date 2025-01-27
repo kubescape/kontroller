@@ -13,6 +13,7 @@ import (
 	"github.com/kubescape/go-logger/helpers"
 	"github.com/kubescape/k8s-interface/k8sinterface"
 	"github.com/kubescape/operator/config"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -84,9 +85,10 @@ func (ch *RegistryCommandsHandler) Start() {
 		select {
 		case cmd := <-ch.commands:
 			if !isRegistryCommand(cmd.Spec.CommandType) {
-				logger.L().Info("not registry command" + cmd.Spec.CommandType)
+				logger.L().Debug("not a registry command" + cmd.Spec.CommandType)
 				continue
 			}
+			ctx, span := otel.Tracer("").Start(context.Background(), "actionHandler.scanRegistriesV2")
 			status := v1alpha1.OperatorCommandStatus{
 				Executer:  "operator",
 				Started:   true,
@@ -95,15 +97,16 @@ func (ch *RegistryCommandsHandler) Start() {
 			var err error
 			var payload []byte
 
+			logger.L().Ctx(ctx).Info(fmt.Sprintf("handling %s command", cmd.Spec.CommandType))
 			switch cmd.Spec.CommandType {
 			case string(command.OperatorCommandTypeCreateRegistry):
-				err = ch.upsertRegistry(cmd, true)
+				err = ch.upsertRegistry(ctx, cmd, true)
 			case string(command.OperatorCommandTypeUpdateRegistry):
-				err = ch.upsertRegistry(cmd, false)
+				err = ch.upsertRegistry(ctx, cmd, false)
 			case string(command.OperatorCommandTypeDeleteRegistry):
-				err = ch.deleteRegistry(cmd)
+				err = ch.deleteRegistry(ctx, cmd)
 			case string(command.OperatorCommandTypeCheckRegistry):
-				payload, err = ch.checkRegistry(cmd)
+				payload, err = ch.checkRegistry(ctx, cmd)
 			}
 
 			status.Completed = true
@@ -114,8 +117,10 @@ func (ch *RegistryCommandsHandler) Start() {
 			} else if len(payload) > 0 {
 				status.Payload = payload
 			}
-			ch.patchCommandStatus(&cmd, status)
 
+			logger.L().Ctx(ctx).Info(fmt.Sprintf("finished handling %s command ", cmd.Spec.CommandType))
+			ch.patchCommandStatus(ctx, &cmd, status)
+			span.End()
 		case <-ch.ctx.Done():
 			logger.L().Ctx(ch.ctx).Info("RegistryCommandsHandler: context done")
 			return
@@ -123,10 +128,11 @@ func (ch *RegistryCommandsHandler) Start() {
 	}
 }
 
-func (ch *RegistryCommandsHandler) patchCommandStatus(command *v1alpha1.OperatorCommand, status v1alpha1.OperatorCommandStatus) {
+func (ch *RegistryCommandsHandler) patchCommandStatus(ctx context.Context, command *v1alpha1.OperatorCommand, status v1alpha1.OperatorCommandStatus) {
+	logger.L().Ctx(ctx).Debug("patchCommandStatus - updating operator command status", helpers.String("command", command.Spec.CommandType), helpers.Interface("status", status))
 	patchBytes, err := json.Marshal(map[string]v1alpha1.OperatorCommandStatus{"status": status})
 	if err != nil {
-		logger.L().Error("patchCommandStatus - failed to marshal status patch", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("patchCommandStatus - failed to marshal status patch", helpers.Error(err))
 		return
 	}
 
@@ -139,94 +145,103 @@ func (ch *RegistryCommandsHandler) patchCommandStatus(command *v1alpha1.Operator
 		"status",
 	)
 	if err != nil {
-		logger.L().Error("patchCommandStatus - failed to patch command status", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("patchCommandStatus - failed to patch command status", helpers.Error(err))
 	}
-	logger.L().Info("patchCommandStatus: command status patched successfully")
+	logger.L().Ctx(ctx).Info("patchCommandStatus: command status patched successfully")
 }
 
-func (ch *RegistryCommandsHandler) checkRegistry(cmd v1alpha1.OperatorCommand) ([]byte, error) {
+func (ch *RegistryCommandsHandler) checkRegistry(ctx context.Context, cmd v1alpha1.OperatorCommand) ([]byte, error) {
 	registry, err := armotypes.UnmarshalRegistry(cmd.Spec.Body)
 	if err != nil {
-		logger.L().Error("checkRegistry - failed to unmarshal command payload", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("checkRegistry - failed to unmarshal command payload", helpers.Error(err))
 		return nil, err
 	}
 	client, err := registryclients.GetRegistryClient(registry)
 	if err != nil {
-		logger.L().Error("checkRegistry - failed to get registry client", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("checkRegistry - failed to get registry client", helpers.Error(err))
 		return nil, err
 	}
 
-	repositories, err := client.GetAllRepositories(context.Background())
+	repositories, err := client.GetAllRepositories(ctx)
 	if err != nil {
-		logger.L().Error("checkRegistry - failed to get registry repositories", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("checkRegistry - failed to get registry repositories", helpers.Error(err))
 		return nil, err
 	}
+	logger.L().Ctx(ctx).Debug(fmt.Sprintf("checkRegistry - found %d repositories", len(repositories)))
 
 	payload, err := json.Marshal(repositories)
 	if err != nil {
+		logger.L().Ctx(ctx).Error("checkRegistry - failed to marshal repositories", helpers.Error(err))
 		return nil, err
 	}
 
 	return payload, nil
 }
 
-func (ch *RegistryCommandsHandler) deleteRegistry(cmd v1alpha1.OperatorCommand) error {
+func (ch *RegistryCommandsHandler) deleteRegistry(ctx context.Context, cmd v1alpha1.OperatorCommand) error {
 	registry, err := armotypes.UnmarshalRegistry(cmd.Spec.Body)
 	if err != nil {
-		logger.L().Error("deleteRegistry - failed to unmarshal command payload", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("deleteRegistry - failed to unmarshal command payload", helpers.Error(err))
 		return err
 	}
 	resourceName := registry.GetBase().ResourceName
 	err = ch.k8sAPI.KubernetesClient.BatchV1().CronJobs(ch.config.Namespace()).Delete(context.Background(), resourceName, metav1.DeleteOptions{})
 	if err != nil {
-		logger.L().Error("deleteRegistry - failed to delete cronjob resource", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("deleteRegistry - failed to delete cronjob resource", helpers.Error(err))
 		return err
 	}
+	logger.L().Ctx(ctx).Debug("deleteRegistry - successfully deleted cronjob")
+
 	err = ch.k8sAPI.KubernetesClient.CoreV1().Secrets(ch.config.Namespace()).Delete(context.Background(), resourceName, metav1.DeleteOptions{})
 	if err != nil {
-		logger.L().Error("deleteRegistry - failed to delete secret resource", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("deleteRegistry - failed to delete secret resource", helpers.Error(err))
 		return err
 	}
+	logger.L().Ctx(ctx).Debug("deleteRegistry - successfully deleted secret")
+
 	err = ch.k8sAPI.KubernetesClient.CoreV1().ConfigMaps(ch.config.Namespace()).Delete(context.Background(), resourceName, metav1.DeleteOptions{})
 	if err != nil {
-		logger.L().Error("deleteRegistry - failed to delete configmap resource", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("deleteRegistry - failed to delete configmap resource", helpers.Error(err))
 		return err
 	}
+	logger.L().Ctx(ctx).Debug("deleteRegistry - successfully deleted configmap")
 
-	logger.L().Info("deleteRegistry: registry deleted successfully")
+	logger.L().Ctx(ctx).Info("deleteRegistry: registry deleted successfully")
 	return nil
 }
 
-func (ch *RegistryCommandsHandler) upsertRegistry(cmd v1alpha1.OperatorCommand, triggerNow bool) error {
+func (ch *RegistryCommandsHandler) upsertRegistry(ctx context.Context, cmd v1alpha1.OperatorCommand, triggerNow bool) error {
 	registry, err := armotypes.UnmarshalRegistry(cmd.Spec.Body)
 	if err != nil {
-		logger.L().Error("upsertRegistry - failed to unmarshal command payload", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("upsertRegistry - failed to unmarshal command payload", helpers.Error(err))
 		return err
 	}
 	errGroup := errgroup.Group{}
 	errGroup.Go(func() error {
 		secret, err := ch.generateSecretObject(registry)
 		if err != nil {
-			logger.L().Error("upsertRegistry - failed to create secret resource", helpers.Error(err))
+			logger.L().Ctx(ctx).Error("upsertRegistry - failed to create secret resource", helpers.Error(err))
 			return err
 		}
 		if err = ch.upsertResource(secret, secretGVR, secret.Name); err != nil {
-			logger.L().Error("upsertRegistry - failed to upsert secret resource", helpers.Error(err))
+			logger.L().Ctx(ctx).Error("upsertRegistry - failed to upsert secret resource", helpers.Error(err))
 			return err
 		}
+		logger.L().Ctx(ctx).Debug("upsertRegistry - successfully upserted secret")
 		return nil
 	})
 
 	errGroup.Go(func() error {
 		configMap, err := ch.generateConfigMapObject(registry)
 		if err != nil {
-			logger.L().Error("upsertRegistry - failed to create config map resource", helpers.Error(err))
+			logger.L().Ctx(ctx).Error("upsertRegistry - failed to create config map resource", helpers.Error(err))
 			return err
 		}
 		if err = ch.upsertResource(configMap, configMapGVR, configMap.Name); err != nil {
-			logger.L().Error("upsertRegistry - failed to upsert config map resource", helpers.Error(err))
+			logger.L().Ctx(ctx).Error("upsertRegistry - failed to upsert config map resource", helpers.Error(err))
 			return err
 		}
+		logger.L().Ctx(ctx).Debug("upsertRegistry - successfully upserted configmap")
 		return nil
 	})
 
@@ -234,35 +249,37 @@ func (ch *RegistryCommandsHandler) upsertRegistry(cmd v1alpha1.OperatorCommand, 
 		if triggerNow {
 			job, err := ch.generateJobObject(registry)
 			if err != nil {
-				logger.L().Error("upsertRegistry - failed to create job resource", helpers.Error(err))
+				logger.L().Ctx(ctx).Error("upsertRegistry - failed to create job resource", helpers.Error(err))
 				return err
 			}
 			if err = ch.upsertResource(job, jobGVR, registry.GetBase().ResourceName); err != nil {
-				logger.L().Error("upsertRegistry - failed to upsert job resource", helpers.Error(err))
+				logger.L().Ctx(ctx).Error("upsertRegistry - failed to upsert job resource", helpers.Error(err))
 				return err
 			}
+			logger.L().Ctx(ctx).Debug("upsertRegistry - successfully upserted job")
 		}
 		if registry.GetBase().ScanFrequency != "" {
 			cronjob, err := ch.generateCronJobObject(registry)
 			if err != nil {
-				logger.L().Error("upsertRegistry - failed to create cron job resource", helpers.Error(err))
+				logger.L().Ctx(ctx).Error("upsertRegistry - failed to create cron job resource", helpers.Error(err))
 				return err
 
 			}
 			if err = ch.upsertResource(cronjob, cronJobGVR, registry.GetBase().ResourceName); err != nil {
-				logger.L().Error("upsertRegistry - failed to upsert job resource", helpers.Error(err))
+				logger.L().Ctx(ctx).Error("upsertRegistry - failed to upsert job resource", helpers.Error(err))
 				return err
 			}
+			logger.L().Ctx(ctx).Debug("upsertRegistry - successfully upserted cronjob")
 		}
 		return nil
 	})
 
 	if err := errGroup.Wait(); err != nil {
-		logger.L().Error("upsertRegistry - failed to upsert registry", helpers.Error(err))
+		logger.L().Ctx(ctx).Error("upsertRegistry - failed to upsert registry", helpers.Error(err))
 		return err
 	}
 
-	logger.L().Info("upsertRegistry: registry upserted successfully")
+	logger.L().Ctx(ctx).Info("upsertRegistry: registry upserted successfully")
 	return nil
 }
 
